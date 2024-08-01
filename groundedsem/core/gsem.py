@@ -1,4 +1,3 @@
-import logging
 import os
 from pathlib import Path
 
@@ -14,15 +13,11 @@ from groundedsem.util.utils import load_model_hf, segment, draw_mask, download_f
 from GroundingDINO.groundingdino.util.inference import annotate, load_image, predict
 from groundedsem import logger
 
+from .base import ModelBase
 
-class GSEM:
+class GSEM(ModelBase):
     def __init__(self, dino_model=None, sam_model=None, device=None, **kwargs):
-        self.PACKAGE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-        # device
-        if not device:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        else:
-            self.device = device
+        super().__init__(sam_model, device, **kwargs)
         # DINO
         if not dino_model:
             logger.info("Use default DINO. Downloading...")
@@ -35,18 +30,6 @@ class GSEM:
             logger.info("DINO Done")
         else:
             self.dino_model = dino_model
-        # SAMs
-        if not sam_model:
-            logger.info("Use default SAM. Downloading...")
-            sam_local = self.PACKAGE_DIR.joinpath(defaults.SAM_CHECKPOINT)
-            download_file_if_not_exist(defaults.SAM_URL, sam_local)
-            logger.info("SAM Done")
-            self.sam_model = build_sam(sam_local)
-        else:
-            self.sam_model = sam_model
-        self.sam_predictor = SamPredictor(self.sam_model.to(self.device))
-        # Others
-        self.params = kwargs.get('params', {})
 
 
     # detect object using grounding DINO
@@ -75,7 +58,7 @@ class GSEM:
         return annotated_frame, boxes, logits, phrases
 
 
-    def sam_segment(self, image_source, boxes, annotated_frame):
+    def sam_segment(self, image_source, boxes):
         segmented_frame_masks = segment(
             image_source, 
             self.sam_predictor, 
@@ -98,7 +81,7 @@ class GSEM:
         annotated_frame = annotate(image_source, boxes, logits, phrases)
         annotated_frame = annotated_frame[...,::-1] # BGR to RGB
         # SAM
-        segmented_frame_masks = self.sam_segment(image_source, boxes, annotated_frame)
+        segmented_frame_masks = self.sam_segment(image_source, boxes)
         for mask in segmented_frame_masks[1:]:
             annotated_frame = draw_mask(mask[0], annotated_frame)
         Image.fromarray(annotated_frame).show()
