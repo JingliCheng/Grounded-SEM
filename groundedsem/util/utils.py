@@ -1,10 +1,13 @@
 from typing import Any, Dict, List
 import requests
 import os
+import json
 
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
+import cv2
+import matplotlib.pyplot as plt
 
 from groundingdino.util.utils import clean_state_dict
 from groundingdino.util import box_ops
@@ -93,3 +96,58 @@ def download_file_if_not_exist(url: str, local_filename: str):
     else:
         print(f"{local_filename} exists, skipping download.")
 
+
+def load_coco_annotations(file_path):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    return data
+
+
+def get_info_bar_height(image):
+        height_pixel = []
+        for column in range(4): # check the first 4 column pixels
+            bar_color = image[-1, column, 0]
+            for pixel, color in enumerate(image[:, column, 0][::-1]):
+                if color != bar_color:
+                    height_pixel.append(image.shape[0] - pixel - 1)
+                    break
+
+        if np.array(height_pixel).std().astype(int) == 0:
+            return height_pixel[0]
+        else:
+            raise ValueError("Failed to detect the information bar size.")
+        
+
+def adjust_image_dimensions(image_dimensions, bar_height, image_id=None):
+        if image_id is not None:
+            image_dimensions[image_id] = (image_dimensions[image_id][0], bar_height)
+        else:
+            for image_id, (width, height) in image_dimensions.items():
+                image_dimensions[image_id] = (width, bar_height)
+        return image_dimensions
+
+
+def get_contours_from_mask(mask):
+    mask = mask.int().squeeze().numpy().astype('uint8')
+    _, thresh = cv2.threshold(mask, 0, 255, 0)
+    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    return contours
+
+
+def plot_contours(image, contours):
+    temp_image = cv2.drawContours(image.copy(), contours, -1, (0,255,0), 3)
+    plt.figure()
+    plt.imshow(temp_image)
+
+
+def get_similarity_score(contour1, contour2):
+    return cv2.matchShapes(contour1[0], contour2[0], 1, 0.0)
+
+
+def compare_contours(mask1, mask2, image=None):
+    contours1 = get_contours_from_mask(mask1)
+    contours2 = get_contours_from_mask(mask2)
+    if image is not None:
+        plot_contours(image, contours1)
+        plot_contours(image, contours2)
+    return get_similarity_score(contours1, contours2)

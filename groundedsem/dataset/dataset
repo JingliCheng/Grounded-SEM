@@ -1,0 +1,239 @@
+import os
+
+import pandas as pd
+import rtree
+
+from groundedsem.util.utils import load_coco_annotations, get_info_bar_height
+from GroundingDINO.groundingdino.util.inference import annotate, load_image
+
+class Dataset:
+    def __init__(self, images_folder_path, annotations_path=None):
+        self.images_folder_path = images_folder_path
+        _files = os.listdir(self.images_folder_path)
+        if annotations_path:
+            self.annotations_path = annotations_path
+            self.load_annotations()
+        else:
+            # find the json file in the images_folder_path
+            json_files = [file for file in _files if file.endswith('.json')]
+            if len(json_files) == 1:
+                self.annotations_path = os.path.join(self.images_folder_path, json_files[0])
+            elif len(json_files) > 1:
+                raise ValueError('Multiple json files found in the images folder')
+            else:
+                raise ValueError('Annotations file not found in the images folder')
+            
+
+
+    def load_images(self):
+        for image in self.annotations['images']:
+            image_path = os.path.join(self.images_folder_path, image['file_name'])
+            image_source, _ = load_image(image_path)
+            image['source'] = image_source
+        print('Images loaded')
+
+
+    def _using_rtree(self, annotations):
+        rtree_idx = rtree.index.Index()
+        non_overlapping_objects = []
+
+        # Insert each bounding box into the R-tree
+        for ann in annotations:
+            bbox = ann['bbox']  # COCO bbox is [x, y, width, height]
+            # Convert to [xmin, ymin, xmax, ymax]
+            bbox_transformed = [bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]]
+            rtree_idx.insert(ann['id'], bbox_transformed)
+
+        # Check for overlaps
+        for ann in annotations:
+            bbox = ann['bbox']
+            bbox_transformed = [bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]]
+            if list(rtree_idx.intersection(bbox_transformed)) == [ann['id']]:
+                non_overlapping_objects.append(ann)
+
+        return non_overlapping_objects
+
+
+    def detect_non_overlapping(self, annotations):
+        filtered_annotations = {}
+
+        # Group annotations by image
+        annotations_by_image = {}
+        for annotation in annotations['annotations']:
+            image_id = annotation['image_id']
+            if image_id not in annotations_by_image:
+                annotations_by_image[image_id] = []
+            annotations_by_image[image_id].append(annotation)
+
+        # Process each image individually
+        for image_id, anns in annotations_by_image.items():
+            non_overlapping_objects = self._using_rtree(anns)
+            filtered_annotations[image_id] = non_overlapping_objects
+
+
+        return filtered_annotations
+    
+
+    def update_non_overlapping(self):
+        filtered_annotations = self.detect_non_overlapping(self.annotations)
+        if 'non_overlapping' in [cat['name'] for cat in self.annotations['categories']]:
+            cate_id = [cat['id'] for cat in self.annotations['categories'] if cat['name'] == 'non_overlapping'][0]
+        else:
+            cate_id = self.annotations['categories'][-1]['id'] + 1
+            self.annotations['categories'].append(
+                {'id': cate_id,
+                'name': 'non_overlapping',
+                })
+        ann_id = self.annotations['annotations'][-1]['id'] + 1
+        for anns in filtered_annotations.items():
+            for ann in anns:
+                ann['category_id'] = cate_id
+                ann['id'] = ann_id
+                ann_id += 1
+                self.annotations['annotations'].append(ann)
+        return filtered_annotations
+    
+
+    def remove_boundary_untouching_bboxes(self, annotations, image_dimensions):
+        """    
+        Similar to detect_non_overlapping()
+        Args:
+            annotations: ...
+            image_dimensions (dict): Dictionary where keys are image_ids and values are (width, height).
+        Returns:
+            dict: A dictionary with image IDs as keys and a list of filtered bounding boxes as values.
+        """
+        filtered_annotations = {}
+        for ann in annotations['annotations']:
+            image_id = ann['image_id']
+            bbox = ann['bbox']  # bbox is [x, y, width, height]
+            xmin, ymin, xmax, ymax = bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]
+            image_width, image_height = image_dimensions[image_id]
+            # Check if the bbox touches or crosses the image boundary
+            if xmin <= 0 or ymin <= 0 or xmax >= image_width or ymax >= image_height:
+                continue  # Exclude this bbox
+            
+            # Append to filtered annotations if not touching the boundary
+            if image_id not in filtered_annotations:
+                filtered_annotations[image_id] = []
+            filtered_annotations[image_id].append(ann)
+        return filtered_annotations
+
+
+    def update_boundary_untouching(self):
+        image_dimensions = self.get_image_dimensions_from_coco(self.annotations)
+        filtered_annotations = self.remove_boundary_untouching_bboxes(self.annotations, image_dimensions)
+        if 'boundary_touching' in [cat['name'] for cat in self.annotations['categories']]:
+            cate_id = [cat['id'] for cat in self.annotations['categories'] if cat['name'] == 'boundary_touching'][0]
+        else:
+            cate_id = self.annotations['categories'][-1]['id'] + 1
+            self.annotations['categories'].append(
+                {'id': cate_id,
+                'name': 'boundary_touching',
+                })
+        ann_id = self.annotations['annotations'][-1]['id'] + 1
+        for anns in filtered_annotations.items():
+            for ann in anns:
+                ann['category_id'] = cate_id
+                ann['id'] = ann_id
+                ann_id += 1
+                self.annotations['annotations'].append(ann)
+
+        return filtered_annotations
+
+
+    def intersect_annotations(self, ann1, ann2):
+        """
+        Assume ann1 and ann2 have the same image_ids.
+        """
+        filtered_annotations = {}
+        for image_id in ann1.keys():
+            set1 = set()
+            set2 = set()
+            if image_id in ann1:
+                for object in ann1[image_id]:
+                    set1.add(object['id'])
+            if image_id in ann2:
+                for object in ann2[image_id]:
+                    set2.add(object['id'])
+            intersection_id = set1.intersection(set2)
+            intersection = []
+            for object in ann1[image_id]:
+                if  object['id'] in intersection_id:
+                    intersection.append(object)
+            filtered_annotations[image_id] = intersection
+        return filtered_annotations
+        
+
+    def update_complete_particle(self):
+        ann1 = self.update_boundary_untouching()
+        ann2 = self.update_non_overlapping()
+        filtered_annotations = self.intersect_annotations(ann1, ann2)
+        if 'complete_particle' in [cat['name'] for cat in self.annotations['categories']]:
+            cate_id = [cat['id'] for cat in self.annotations['categories'] if cat['name'] == 'complete_particle'][0]
+        else:
+            cate_id = self.annotations['categories'][-1]['id'] + 1
+            self.annotations['categories'].append(
+                {'id': cate_id,
+                'name': 'complete_particle',
+                })
+        ann_id = self.annotations['annotations'][-1]['id'] + 1
+        for anns in filtered_annotations.items():
+            for ann in anns:
+                ann['category_id'] = cate_id
+                ann['id'] = ann_id
+                ann_id += 1
+                self.annotations['annotations'].append(ann)
+
+
+    def get_image_dimensions_from_coco(self, annotations):
+        image_dimensions = {}
+        for img in annotations['images']:
+            image_dimensions[img['id']] =(img['width'], img['height'])
+        return image_dimensions
+    
+
+    def adjust_image_dimensions(self):
+        for image in self.annotations['images']:
+            image_source = image['source']
+            bar_height = get_info_bar_height(image_source)
+            image['adjust_height'] = bar_height
+
+
+
+
+class BaseAnnotation:
+    def __init__(self, data):
+        self.data = data
+
+    def get_by_id(self, id):
+        # Implementation specific to single annotation
+        pass
+
+    def get_xyxy(self):
+        # Convert coords to xyxy format
+        pass
+
+class FullAnnotation(BaseAnnotation):
+    def __init__(self, annotations):
+        super().__init__(annotations)
+
+    def get_by_id(self, id):
+        # Return a SubAnnotation matching the ID
+        return SubAnnotation(next(anno for anno in self.data if anno['id'] == id))
+
+    def get_xyxy(self):
+        # Apply get_xyxy to all contained SubAnnotations
+        for anno in self.data:
+            anno.get_xyxy()
+
+class SubAnnotation(BaseAnnotation):
+    def __init__(self, annotation):
+        super().__init__(annotation)
+
+
+# Usage
+full_anno = FullAnnotation(all_annotations)
+sub_anno = full_anno.get_by_id(some_id)
+sub_anno.get_xyxy()  # Applies to just this sub-annotation
+full_anno.get_xyxy()  # Applies to all sub-annotations
